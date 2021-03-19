@@ -8,6 +8,28 @@ import WebWorkerTemplatePlugin from 'webpack/lib/webworker/WebWorkerTemplatePlug
 export default function loader() {}
 
 const CACHE = {};
+const tapName = 'workerize-loader';
+
+function compilationHook(compiler, handler) {
+	if (compiler.hooks) {
+		return compiler.hooks.compilation.tap(tapName, handler);
+	}
+	return compiler.plugin('compilation', handler);
+}
+
+function parseHook(data, handler) {
+	if (data.normalModuleFactory.hooks) {
+		return data.normalModuleFactory.hooks.parser.for('javascript/auto').tap(tapName, handler);
+	}
+	return data.normalModuleFactory.plugin('parser', handler);
+}
+
+function exportDeclarationHook(parser, handler) {
+	if (parser.hooks) {
+		return parser.hooks.exportDeclaration.tap(tapName, handler);
+	}
+	return parser.plugin('export declaration', handler);
+}
 
 loader.pitch = function(request) {
 	this.cacheable(false);
@@ -16,7 +38,7 @@ loader.pitch = function(request) {
 
 	const cb = this.async();
 
-	const filename = loaderUtils.interpolateName(this, `${options.name || '[hash]'}.worker.js`, {
+	const filename = loaderUtils.interpolateName(this, `${options.name || '[fullhash]'}.worker.js`, {
 		context: options.context || this.rootContext || this.options.context,
 		regExp: options.regExp
 	});
@@ -29,36 +51,75 @@ loader.pitch = function(request) {
 		namedChunkFilename: null
 	};
 
-	worker.compiler = this._compilation.createChildCompiler('worker', worker.options);
-
-	worker.compiler.apply(new WebWorkerTemplatePlugin(worker.options));
-
-	if (this.target!=='webworker' && this.target!=='web') {
-		worker.compiler.apply(new NodeTargetPlugin());
+	const compilerOptions = this._compiler.options || {};
+	if (compilerOptions.output && compilerOptions.output.globalObject==='window') {
+		console.warn('Warning (workerize-loader): output.globalObject is set to "window". It should be set to "self" or "this" to support HMR in Workers.');
 	}
 
-	worker.compiler.apply(new SingleEntryPlugin(this.context, `!!${path.resolve(__dirname, 'rpc-worker-loader.js')}!${request}`, 'main'));
+	worker.compiler = this._compilation.createChildCompiler('worker', worker.options);
+
+	(new WebWorkerTemplatePlugin(worker.options)).apply(worker.compiler);
+
+	if (this.target!=='webworker' && this.target!=='web') {
+		(new NodeTargetPlugin()).apply(worker.compiler);
+	}
+
+	// webpack >= v4 supports webassembly
+	let wasmPluginPath = null;
+	try {
+		wasmPluginPath = require.resolve(
+			'webpack/lib/web/FetchCompileWasmTemplatePlugin'
+		);
+	}
+	catch (_err) {
+		// webpack <= v3, skipping
+	}
+
+	if (wasmPluginPath) {
+		// eslint-disable-next-line global-require
+		const FetchCompileWasmTemplatePlugin = require(wasmPluginPath);
+		new FetchCompileWasmTemplatePlugin({
+			mangleImports: this._compiler.options.optimization.mangleWasmImports
+		}).apply(worker.compiler);
+	}
+
+	(new SingleEntryPlugin(this.context, `!!${path.resolve(__dirname, 'rpc-worker-loader.js')}!${request}`, 'main')).apply(worker.compiler);
 
 	const subCache = `subcache ${__dirname} ${request}`;
 
-	worker.compiler.plugin('compilation', (compilation, data) => {
+	compilationHook(worker.compiler, (compilation, data) => {
 		if (compilation.cache) {
-			if (!compilation.cache[subCache]) compilation.cache[subCache] = {};
-
-			compilation.cache = compilation.cache[subCache];
+			let cache;
+			if (compilation.cache instanceof Map) {
+				cache = compilation.cache.get(subCache);
+				if (!cache) {
+					cache = new Map();
+					compilation.cache.set(subCache, cache);
+				}
+			}
+			else if (!compilation.cache[subCache]) {
+				cache = compilation.cache[subCache] = {};
+			}
+			
+			compilation.cache = cache;
 		}
+		parseHook(data, (parser, options) => {
+			exportDeclarationHook(parser, expr => {
+				let decl = expr.declaration || expr;
+				let	{ compilation, current } = parser.state;
 
-		data.normalModuleFactory.plugin('parser', (parser, options) => {
-			parser.plugin('export declaration', expr => {
-				let decl = expr.declaration || expr,
-					{ compilation, current } = parser.state,
-					entry = compilation.entries[0].resource;
+				let entryModule =
+					compilation.entries instanceof Map
+						? compilation.moduleGraph.getModule(
+							compilation.entries.get('main').dependencies[0]
+						  )
+						: compilation.entries[0];
 
 				// only process entry exports
-				if (current.resource!==entry) return;
+				if (current.resource!==entryModule.resource) return;
 
-				let exports = compilation.__workerizeExports || (compilation.__workerizeExports = {});
-
+				let key = current.nameForCondition();
+				let exports = CACHE[key] || (CACHE[key] = {});
 				if (decl.id) {
 					exports[decl.id.name] = true;
 				}
@@ -70,6 +131,20 @@ loader.pitch = function(request) {
 				else {
 					console.warn('[workerize] unknown export declaration: ', expr);
 				}
+
+				// This is for Webpack 5: mark the exports as used so it does not get tree-shaken away on production build
+				if (compilation.moduleGraph) {
+					const { getEntryRuntime } = require('webpack/lib/util/runtime');
+					const { UsageState } = require('webpack');
+					const runtime = getEntryRuntime(compilation, 'main');
+					for (const exportName of Object.keys(exports)) {
+						const exportInfo = compilation.moduleGraph.getExportInfo(entryModule, exportName);
+						exportInfo.setUsed(UsageState.Used, runtime);
+						exportInfo.canMangleUse = false;
+						exportInfo.canMangleProvide = false;
+					}
+					compilation.moduleGraph.addExtraReason(entryModule, 'used by workerize-loader');
+				}
 			});
 		});
 	});
@@ -78,15 +153,30 @@ loader.pitch = function(request) {
 		if (err) return cb(err);
 
 		if (entries[0]) {
-			worker.file = entries[0].files[0];
+			worker.file = Array.from(entries[0].files)[0];
+			const entryModules =
+				compilation.chunkGraph &&
+				compilation.chunkGraph.getChunkEntryModulesIterable
+					? Array.from(
+						compilation.chunkGraph.getChunkEntryModulesIterable(entries[0])
+					  )
+					: null;
+			const entryModule =
+				entryModules && entryModules.length > 0
+					? entryModules[0]
+					: entries[0].entryModule;
 
+			let key = entryModule.nameForCondition();
 			let contents = compilation.assets[worker.file].source();
-			let exports = Object.keys(CACHE[worker.file] = compilation.__workerizeExports || CACHE[worker.file] || {});
+			let exports = Object.keys(CACHE[key] || {});
 
 			// console.log('Workerized exports: ', exports.join(', '));
 
 			if (options.inline) {
 				worker.url = `URL.createObjectURL(new Blob([${JSON.stringify(contents)}]))`;
+			}
+			else if (options.publicPath) {
+				worker.url = `${JSON.stringify(options.publicPath + worker.file)}`;
 			}
 			else {
 				worker.url = `__webpack_public_path__ + ${JSON.stringify(worker.file)}`;
@@ -96,11 +186,16 @@ loader.pitch = function(request) {
 				delete this._compilation.assets[worker.file];
 			}
 
+			let workerUrl = worker.url;
+			if (options.import) {
+				workerUrl = `"data:,importScripts('"+location.origin+${workerUrl}+"')"`;
+			}
+
 			return cb(null, `
 				var addMethods = require(${loaderUtils.stringifyRequest(this, path.resolve(__dirname, 'rpc-wrapper.js'))})
 				var methods = ${JSON.stringify(exports)}
 				module.exports = function() {
-					var w = new Worker(${worker.url}, { name: ${JSON.stringify(filename)} })
+					var w = new Worker(${workerUrl}, { name: ${JSON.stringify(filename)} })
 					addMethods(w, methods)
 					${ options.ready ? 'w.ready = new Promise(function(r) { w.addEventListener("ready", function(){ r(w) }) })' : '' }
 					return w

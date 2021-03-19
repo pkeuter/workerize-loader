@@ -10,11 +10,16 @@ function workerSetup() {
 			else {
 				p = Promise.reject('No such method');
 			}
-			p.then(
-				result => {
-					postMessage({ type: 'RPC', id, result });
-				},
-				error => {
+			p.then(result => {
+				postMessage({ type: 'RPC', id, result });
+			})
+				.catch(e => {
+					let error = { message: e };
+					if (e.stack) {
+						error.message = e.message;
+						error.stack = e.stack;
+						error.name = e.name;
+					}
 					postMessage({ type: 'RPC', id, error });
 				});
 		}
@@ -24,6 +29,7 @@ function workerSetup() {
 
 const workerScript = '\n' + Function.prototype.toString.call(workerSetup).replace(/(^.*\{|\}.*$|\n\s*)/g, '');
 
-export default function rpcWorkerLoader(content) {
-	return content + workerScript;
+export default function rpcWorkerLoader(content, sourceMap) {
+	const callback = this.async();
+	callback(null, content + workerScript, sourceMap);
 }
