@@ -18,7 +18,15 @@ function workerSetup() {
                     id: id,
                     result: result
                 });
-            }, function (error) {
+            }).catch(function (e) {
+                var error = {
+                    message: e
+                };
+                if (e.stack) {
+                    error.message = e.message;
+                    error.stack = e.stack;
+                    error.name = e.name;
+                }
                 postMessage({
                     type: 'RPC',
                     id: id,
@@ -34,8 +42,9 @@ function workerSetup() {
 }
 
 var workerScript = '\n' + Function.prototype.toString.call(workerSetup).replace(/(^.*\{|\}.*$|\n\s*)/g, '');
-function rpcWorkerLoader(content) {
-    return content + workerScript;
+function rpcWorkerLoader(content, sourceMap) {
+    var callback = this.async();
+    callback(null, content + workerScript, sourceMap);
 }
 
 module.exports = rpcWorkerLoader;

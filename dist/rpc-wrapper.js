@@ -9,14 +9,15 @@ function addMethods(worker, methods) {
             var f = callbacks[d.id];
             if (f) {
                 delete callbacks[d.id];
-                if (d.error) 
-                    { f[1](d.error); }
-                 else 
-                    { f[0](d.result); }
+                if (d.error) {
+                    f[1](Object.assign(Error(d.error.message), d.error));
+                } else {
+                    f[0](d.result);
+                }
             }
         } else {
             var evt = document.createEvent('Event');
-            evt.initEvent(d.method);
+            evt.initEvent(d.method, false, false);
             evt.data = d.params;
             worker.dispatchEvent(evt);
         }

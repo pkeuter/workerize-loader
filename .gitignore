@@ -1,8 +1,7 @@
 node_modules
-.DS_Store
-.cache
-.mocha-puppeteer
-*.log
-build
 package-lock.json
 yarn.lock
+dist
+coverage
+.DS_Store
+*.log
